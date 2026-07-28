@@ -5,11 +5,12 @@ import struct
 import unittest
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageChops
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = PROJECT_ROOT / "assets" / "sprite_manifest.json"
+PET_APP_PATH = PROJECT_ROOT / "pet_app.py"
 
 
 def png_size(path: Path) -> tuple[int, int]:
@@ -27,7 +28,10 @@ class ProjectTests(unittest.TestCase):
     def test_expanded_actions_exist(self) -> None:
         expected = {
             "idle",
+            "idle_motion",
             "walk",
+            "walk_start",
+            "walk_stop",
             "click",
             "cute_idle",
             "wave",
@@ -49,6 +53,19 @@ class ProjectTests(unittest.TestCase):
             "held_drag",
             "release_fall",
             "soft_land",
+            "time_morning",
+            "time_day",
+            "time_night",
+            "time_morning_motion",
+            "time_day_motion",
+            "time_night_motion",
+            "angry_enter",
+            "angry_hold",
+            "angry_calm",
+            "heart",
+            "sit_sway",
+            "curtsey",
+            "cheek_puff",
         }
         self.assertTrue(expected <= self.manifest["actions"].keys())
         self.assertNotIn("peek_top", self.manifest["actions"])
@@ -72,9 +89,15 @@ class ProjectTests(unittest.TestCase):
                 self.assertLessEqual(x + width, sheet_width)
                 self.assertLessEqual(y + height, sheet_height)
 
+        for x, y, width, height in self.manifest["gaze"]["frames"].values():
+            self.assertGreaterEqual(x, 0)
+            self.assertGreaterEqual(y, 0)
+            self.assertLessEqual(x + width, sheet_width)
+            self.assertLessEqual(y + height, sheet_height)
+
     def test_expanded_sheet_dimensions(self) -> None:
         sheet_path = MANIFEST_PATH.parent / self.manifest["spritesheet"]
-        self.assertEqual((1024, 8000), png_size(sheet_path))
+        self.assertEqual((1024, 11840), png_size(sheet_path))
 
     def test_running_cycle_has_eight_distinct_consistent_frames(self) -> None:
         action = self.manifest["actions"]["walk"]
@@ -115,6 +138,37 @@ class ProjectTests(unittest.TestCase):
         self.assertLessEqual(max(alpha_heights("idle")) - min(alpha_heights("idle")), 3)
         self.assertLessEqual(max(alpha_heights("click")) - min(alpha_heights("click")), 12)
 
+        # Compare each pack at its tallest natural pose. Sitting and bowing may
+        # legitimately reduce silhouette height, but switching packs must not
+        # make the same character suddenly grow or shrink.
+        reference_height = max(alpha_heights("idle"))
+        comparable_actions = (
+            "walk",
+            "click",
+            "cute_idle",
+            "wave",
+            "shy",
+            "sleepy",
+            "time_morning_motion",
+            "time_day_motion",
+            "time_night_motion",
+            "angry_enter",
+            "angry_hold",
+            "angry_calm",
+            "heart",
+            "sit_sway",
+            "curtsey",
+            "cheek_puff",
+        )
+        self.assertGreaterEqual(reference_height, 258)
+        self.assertLessEqual(reference_height, 262)
+        for action_name in comparable_actions:
+            self.assertLessEqual(
+                abs(max(alpha_heights(action_name)) - reference_height),
+                5,
+                action_name,
+            )
+
     def test_sleep_subject_anchor_does_not_jump(self) -> None:
         sheet_path = MANIFEST_PATH.parent / self.manifest["spritesheet"]
         sheet = Image.open(sheet_path).convert("RGBA")
@@ -124,12 +178,12 @@ class ProjectTests(unittest.TestCase):
         for action_name in ("sit_down", "doze_off", "sleep", "wake"):
             for x, y, width, height in self.manifest["actions"][action_name]["frames"]:
                 alpha = sheet.crop((x, y, x + width, y + height)).getchannel("A")
-                left, _top, right, _bottom = self._robust_alpha_bounds(alpha)
+                left, _top, right, bottom = self._dominant_alpha_bounds(alpha)
                 centers.append((left + right) / 2)
-                bottoms.append(self._meaningful_alpha_bottom(alpha))
+                bottoms.append(bottom)
 
-        self.assertLessEqual(max(centers) - min(centers), 3.0)
-        self.assertLessEqual(max(bottoms) - min(bottoms), 2)
+        self.assertLessEqual(max(centers) - min(centers), 1.0)
+        self.assertLessEqual(max(bottoms) - min(bottoms), 0)
 
         sleep_tops: list[int] = []
         for x, y, width, height in self.manifest["actions"]["sleep"]["frames"]:
@@ -186,18 +240,324 @@ class ProjectTests(unittest.TestCase):
 
         return lower(x_counts), lower(y_counts), upper(x_counts), upper(y_counts)
 
+    @staticmethod
+    def _dominant_alpha_bounds(alpha: Image.Image) -> tuple[int, int, int, int]:
+        width, height = alpha.size
+        pixels = alpha.load()
+        visited = bytearray(width * height)
+        components: list[list[tuple[int, int]]] = []
+        for start_y in range(height):
+            for start_x in range(width):
+                offset = start_y * width + start_x
+                if visited[offset] or pixels[start_x, start_y] < 32:
+                    continue
+                visited[offset] = 1
+                stack = [(start_x, start_y)]
+                component: list[tuple[int, int]] = []
+                while stack:
+                    x, y = stack.pop()
+                    component.append((x, y))
+                    for next_y in range(max(0, y - 1), min(height, y + 2)):
+                        for next_x in range(max(0, x - 1), min(width, x + 2)):
+                            next_offset = next_y * width + next_x
+                            if (
+                                not visited[next_offset]
+                                and pixels[next_x, next_y] >= 32
+                            ):
+                                visited[next_offset] = 1
+                                stack.append((next_x, next_y))
+                components.append(component)
+        if not components:
+            raise AssertionError("帧中没有有效角色主体")
+        subject = max(components, key=len)
+        xs = [point[0] for point in subject]
+        ys = [point[1] for point in subject]
+        return min(xs), min(ys), max(xs) + 1, max(ys) + 1
+
     def test_interactions_have_real_middle_frames(self) -> None:
         actions = self.manifest["actions"]
-        self.assertEqual(8, len(actions["click"]["frames"]))
-        self.assertEqual(8, len(actions["wave"]["frames"]))
+        self.assertGreaterEqual(len(actions["click"]["frames"]), 10)
+        self.assertGreaterEqual(len(actions["wave"]["frames"]), 8)
+        self.assertGreaterEqual(len(actions["heart"]["frames"]), 8)
         self.assertGreater(sum(actions["click"]["durations_ms"]), 1800)
-        self.assertGreater(sum(actions["wave"]["durations_ms"]), 1800)
+        self.assertGreater(sum(actions["wave"]["durations_ms"]), 3000)
+        self.assertGreater(sum(actions["heart"]["durations_ms"]), 3500)
+
+    def test_wave_frames_have_no_cross_cell_vertical_jump(self) -> None:
+        sheet_path = MANIFEST_PATH.parent / self.manifest["spritesheet"]
+        sheet = Image.open(sheet_path).convert("RGBA")
+        heights: list[int] = []
+        bottoms: list[int] = []
+        for x, y, width, height in self.manifest["actions"]["wave"]["frames"]:
+            bounds = sheet.crop(
+                (x, y, x + width, y + height)
+            ).getchannel("A").getbbox()
+            self.assertIsNotNone(bounds)
+            assert bounds is not None
+            heights.append(bounds[3] - bounds[1])
+            bottoms.append(bounds[3])
+        self.assertLessEqual(max(heights), 280)
+        self.assertLessEqual(max(heights) - min(heights), 16)
+        self.assertLessEqual(max(bottoms) - min(bottoms), 1)
 
     def test_interaction_actions_are_valid(self) -> None:
         known = set(self.manifest["actions"])
         interaction = self.manifest["interaction"]
         self.assertTrue(set(interaction["click_actions"]) <= known)
         self.assertTrue(set(interaction["random_idle_actions"]) <= known)
+        self.assertEqual(
+            set(interaction["random_idle_actions"]),
+            set(interaction["random_idle_weights"]),
+        )
+        self.assertTrue(
+            all(value > 0 for value in interaction["random_idle_weights"].values())
+        )
+
+    def test_idle_is_quiet_and_moves_about_every_five_seconds(self) -> None:
+        actions = self.manifest["actions"]
+        self.assertEqual(1, len(actions["idle"]["frames"]))
+        self.assertEqual(1, len(actions["time_morning"]["frames"]))
+        self.assertEqual(1, len(actions["time_day"]["frames"]))
+        self.assertEqual(1, len(actions["time_night"]["frames"]))
+
+        delay_min, delay_max = self.manifest["interaction"][
+            "random_idle_delay_ms"
+        ]
+        self.assertGreaterEqual(delay_min, 4000)
+        self.assertLessEqual(delay_max, 6500)
+        self.assertLess(delay_min, delay_max)
+        self.assertGreaterEqual(len(actions["idle_motion"]["frames"]), 7)
+
+        motion_actions = self.manifest["time_state"]["motion_actions"]
+        self.assertEqual({"morning", "day", "night"}, set(motion_actions))
+        for action_name in motion_actions.values():
+            self.assertIn(action_name, actions)
+            self.assertFalse(actions[action_name]["loop"])
+            self.assertGreaterEqual(len(actions[action_name]["frames"]), 7)
+
+    def test_smooth_render_and_stable_click_configuration(self) -> None:
+        animation = self.manifest["animation"]
+        self.assertGreaterEqual(animation["render_fps"], 24)
+        self.assertLessEqual(animation["render_fps"], 60)
+        self.assertGreater(animation["tween_fraction"], 0)
+        self.assertTrue(
+            {"click", "wave", "idle_motion"}
+            <= set(animation["tween_actions"])
+        )
+        # Cross-fading two noticeably tilted whole-body frames creates a
+        # double-image ghost. These actions use their real source frames only.
+        self.assertNotIn("sit_sway", animation["tween_actions"])
+        self.assertNotIn("cheek_puff", animation["tween_actions"])
+
+        click_actions = self.manifest["interaction"]["click_actions"]
+        self.assertTrue(click_actions)
+        for action_name in click_actions:
+            self.assertGreaterEqual(
+                len(self.manifest["actions"][action_name]["frames"]),
+                8,
+            )
+
+    def test_sigh_and_small_idle_actions_have_time_to_read(self) -> None:
+        actions = self.manifest["actions"]
+        self.assertGreaterEqual(sum(actions["idle_motion"]["durations_ms"]), 6000)
+        self.assertGreaterEqual(max(actions["idle_motion"]["durations_ms"]), 1800)
+        self.assertGreaterEqual(actions["idle_motion"]["durations_ms"][1], 1000)
+        self.assertGreaterEqual(actions["idle_motion"]["durations_ms"][5], 900)
+        self.assertGreaterEqual(sum(actions["click"]["durations_ms"]), 3500)
+        self.assertGreaterEqual(sum(actions["cute_idle"]["durations_ms"]), 3500)
+        self.assertGreaterEqual(sum(actions["wave"]["durations_ms"]), 4500)
+        self.assertGreaterEqual(sum(actions["shy"]["durations_ms"]), 4000)
+        self.assertGreaterEqual(sum(actions["sleepy"]["durations_ms"]), 4500)
+        for action_name in self.manifest["time_state"]["motion_actions"].values():
+            self.assertGreaterEqual(
+                sum(actions[action_name]["durations_ms"]),
+                3800,
+                action_name,
+            )
+
+    def test_click_action_subject_anchor_is_stable(self) -> None:
+        sheet_path = MANIFEST_PATH.parent / self.manifest["spritesheet"]
+        sheet = Image.open(sheet_path).convert("RGBA")
+        centers: list[float] = []
+        bottoms: list[int] = []
+
+        for action_name in self.manifest["interaction"]["click_actions"]:
+            for x, y, width, height in self.manifest["actions"][action_name]["frames"]:
+                alpha = sheet.crop((x, y, x + width, y + height)).getchannel("A")
+                bounds = self._dominant_alpha_bounds(alpha)
+                left, _top, right, _bottom = bounds
+                centers.append((left + right) / 2)
+                bottoms.append(bounds[3])
+
+        self.assertLessEqual(max(centers) - min(centers), 1.0)
+        self.assertLessEqual(max(bottoms) - min(bottoms), 0)
+
+    def test_surprise_sigh_and_wave_visual_alignment(self) -> None:
+        sheet_path = MANIFEST_PATH.parent / self.manifest["spritesheet"]
+        sheet = Image.open(sheet_path).convert("RGBA")
+        actions = self.manifest["actions"]
+
+        x, y, width, height = actions["idle"]["frames"][0]
+        idle_bounds = sheet.crop(
+            (x, y, x + width, y + height)
+        ).getchannel("A").getbbox()
+        self.assertIsNotNone(idle_bounds)
+        assert idle_bounds is not None
+        idle_center = (idle_bounds[0] + idle_bounds[2]) / 2
+        idle_height = idle_bounds[3] - idle_bounds[1]
+
+        for frame_index in (1, 3):
+            x, y, width, height = actions["idle_motion"]["frames"][frame_index]
+            bounds = sheet.crop(
+                (x, y, x + width, y + height)
+            ).getchannel("A").getbbox()
+            self.assertIsNotNone(bounds)
+            assert bounds is not None
+            center = (bounds[0] + bounds[2]) / 2
+            self.assertLessEqual(abs(center - idle_center), 3.0)
+
+        wave_heights: list[int] = []
+        for x, y, width, height in actions["wave"]["frames"][1:-1]:
+            bounds = sheet.crop(
+                (x, y, x + width, y + height)
+            ).getchannel("A").getbbox()
+            self.assertIsNotNone(bounds)
+            assert bounds is not None
+            wave_heights.append(bounds[3] - bounds[1])
+        self.assertGreaterEqual(min(wave_heights), idle_height - 6)
+        self.assertLessEqual(max(wave_heights), idle_height + 2)
+
+    def test_upper_gaze_frame_mapping_is_not_reversed(self) -> None:
+        gaze_frames = self.manifest["gaze"]["frames"]
+        self.assertEqual([768, 8000, 256, 320], gaze_frames["upper_left"])
+        self.assertEqual([256, 8000, 256, 320], gaze_frames["upper_right"])
+
+    def test_click_guard_and_bubble_dismiss_are_implemented(self) -> None:
+        source = PET_APP_PATH.read_text(encoding="utf-8")
+        self.assertIn("def dismiss(self) -> None:", source)
+        self.assertIn("if self._speech_bubble.isVisible():", source)
+        self.assertIn("if self._interaction_active:", source)
+        self.assertIn("self._dismiss_bubble_on_release", source)
+
+    def test_gaze_time_anger_and_speech_configuration(self) -> None:
+        gaze = self.manifest["gaze"]
+        self.assertTrue(gaze["enabled_default"])
+        self.assertGreaterEqual(gaze["radius_px"], 1000)
+        self.assertEqual(2, len(gaze["spontaneous_delay_ms"]))
+        self.assertEqual(2, len(gaze["duration_ms"]))
+        self.assertGreater(gaze["click_follow_duration_ms"], 0)
+        self.assertEqual(
+            {
+                "left",
+                "upper_left",
+                "up",
+                "upper_right",
+                "right",
+                "lower_right",
+                "down",
+                "lower_left",
+            },
+            set(gaze["frames"]),
+        )
+
+        time_state = self.manifest["time_state"]
+        self.assertEqual("08:30", time_state["work_start"])
+        self.assertEqual("11:40", time_state["lunch_start"])
+        self.assertEqual("12:30", time_state["lunch_end"])
+        self.assertEqual("17:20", time_state["work_end"])
+        self.assertEqual(
+            {"morning", "day", "night"},
+            set(time_state["visual_actions"]),
+        )
+        self.assertTrue(set(time_state["visual_actions"].values()) <= set(self.manifest["actions"]))
+        self.assertEqual(
+            {"idle"},
+            set(time_state["visual_actions"].values()),
+        )
+
+        anger = self.manifest["anger"]
+        self.assertGreaterEqual(anger["click_threshold"], 2)
+        self.assertGreater(anger["click_window_ms"], 0)
+        self.assertGreater(anger["duration_ms"], 0)
+        self.assertFalse(self.manifest["actions"]["angry_enter"]["loop"])
+        self.assertTrue(self.manifest["actions"]["angry_hold"]["loop"])
+        self.assertFalse(self.manifest["actions"]["angry_calm"]["loop"])
+
+        speech = self.manifest["speech"]
+        self.assertTrue(speech["enabled_default"])
+        self.assertEqual(2, len(speech["delay_ms"]))
+        self.assertLess(speech["delay_ms"][0], speech["delay_ms"][1])
+        for phase in (
+            "early_morning",
+            "before_work",
+            "work_morning",
+            "lunch",
+            "work_afternoon",
+            "after_work",
+            "night",
+            "day_off",
+            "angry",
+        ):
+            self.assertTrue(speech["phrases"][phase])
+
+    def test_new_cute_actions_are_slow_and_stably_anchored(self) -> None:
+        sheet_path = MANIFEST_PATH.parent / self.manifest["spritesheet"]
+        sheet = Image.open(sheet_path).convert("RGBA")
+        for action_name in ("heart", "sit_sway", "curtsey", "cheek_puff"):
+            action = self.manifest["actions"][action_name]
+            self.assertFalse(action["loop"])
+            self.assertGreaterEqual(len(action["frames"]), 8)
+            self.assertGreater(sum(action["durations_ms"]), 3000)
+            centers: list[float] = []
+            bottoms: list[int] = []
+            for x, y, width, height in action["frames"]:
+                bounds = self._dominant_alpha_bounds(
+                    sheet.crop(
+                        (x, y, x + width, y + height)
+                    ).getchannel("A")
+                )
+                centers.append((bounds[0] + bounds[2]) / 2)
+                bottoms.append(bounds[3])
+            self.assertLessEqual(max(centers) - min(centers), 1.0, action_name)
+            self.assertLessEqual(max(bottoms) - min(bottoms), 0, action_name)
+
+    def test_new_character_assets_keep_a_stable_baseline(self) -> None:
+        sheet_path = MANIFEST_PATH.parent / self.manifest["spritesheet"]
+        sheet = Image.open(sheet_path).convert("RGBA")
+        action_names = (
+            "time_morning",
+            "time_day",
+            "time_night",
+            "angry_enter",
+            "angry_hold",
+            "angry_calm",
+        )
+        for action_name in action_names:
+            bottoms: list[int] = []
+            heights: list[int] = []
+            for x, y, width, height in self.manifest["actions"][action_name]["frames"]:
+                bounds = sheet.crop(
+                    (x, y, x + width, y + height)
+                ).getchannel("A").getbbox()
+                self.assertIsNotNone(bounds)
+                assert bounds is not None
+                bottoms.append(bounds[3])
+                heights.append(bounds[3] - bounds[1])
+            self.assertLessEqual(max(bottoms) - min(bottoms), 1, action_name)
+            self.assertLessEqual(max(heights) - min(heights), 9, action_name)
+
+        gaze_heights: list[int] = []
+        gaze_bottoms: list[int] = []
+        for x, y, width, height in self.manifest["gaze"]["frames"].values():
+            bounds = sheet.crop(
+                (x, y, x + width, y + height)
+            ).getchannel("A").getbbox()
+            self.assertIsNotNone(bounds)
+            assert bounds is not None
+            gaze_heights.append(bounds[3] - bounds[1])
+            gaze_bottoms.append(bounds[3])
+        self.assertLessEqual(max(gaze_bottoms) - min(gaze_bottoms), 1)
+        self.assertLessEqual(max(gaze_heights) - min(gaze_heights), 9)
 
     def test_sleep_drag_and_edge_action_configuration(self) -> None:
         actions = self.manifest["actions"]
@@ -211,8 +571,8 @@ class ProjectTests(unittest.TestCase):
         self.assertTrue(actions["peek_right_hold"]["loop"])
         self.assertEqual(1, len(actions["peek_left_hold"]["frames"]))
         self.assertEqual(1, len(actions["peek_right_hold"]["frames"]))
-        self.assertEqual(8, len(actions["peek_left_exit"]["frames"]))
-        self.assertEqual(8, len(actions["peek_right_exit"]["frames"]))
+        self.assertEqual(9, len(actions["peek_left_exit"]["frames"]))
+        self.assertEqual(9, len(actions["peek_right_exit"]["frames"]))
         self.assertFalse(actions["grab_lift"]["loop"])
         self.assertTrue(actions["held_drag"]["loop"])
         self.assertFalse(actions["release_fall"]["loop"])
@@ -222,6 +582,92 @@ class ProjectTests(unittest.TestCase):
         self.assertTrue(sleep["enabled_default"])
         self.assertEqual(2, len(sleep["inactivity_delay_ms"]))
         self.assertLess(sleep["inactivity_delay_ms"][0], sleep["inactivity_delay_ms"][1])
+        self.assertEqual(2, len(sleep["duration_ms"]))
+        self.assertGreater(sleep["duration_ms"][0], 0)
+        self.assertLess(sleep["duration_ms"][0], sleep["duration_ms"][1])
+        source = PET_APP_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "self._auto_wake_timer.timeout.connect(self._wake_from_sleep)",
+            source,
+        )
+        self.assertIn("transition_ms + random.randint", source)
+
+    def test_common_actions_enter_and_leave_through_neutral_idle(self) -> None:
+        idle_frame = self.manifest["actions"]["idle"]["frames"][0]
+        actions = self.manifest["actions"]
+        for action_name in (
+            "click",
+            "cute_idle",
+            "wave",
+            "shy",
+            "sleepy",
+            "heart",
+            "sit_sway",
+            "curtsey",
+            "cheek_puff",
+            "time_morning_motion",
+            "time_day_motion",
+            "time_night_motion",
+        ):
+            self.assertEqual(idle_frame, actions[action_name]["frames"][0], action_name)
+            self.assertEqual(idle_frame, actions[action_name]["frames"][-1], action_name)
+        self.assertEqual(idle_frame, actions["walk_start"]["frames"][0])
+        self.assertEqual(idle_frame, actions["walk_stop"]["frames"][-1])
+        self.assertEqual(idle_frame, actions["wake"]["frames"][-1])
+        self.assertEqual(idle_frame, actions["soft_land"]["frames"][-1])
+        self.assertEqual(idle_frame, actions["angry_enter"]["frames"][0])
+        self.assertEqual(idle_frame, actions["angry_calm"]["frames"][-1])
+
+    def test_left_and_right_peek_artwork_are_exact_mirrors(self) -> None:
+        sheet_path = MANIFEST_PATH.parent / self.manifest["spritesheet"]
+        sheet = Image.open(sheet_path).convert("RGBA")
+        for left_action, right_action in (
+            ("peek_left_enter", "peek_right_enter"),
+            ("peek_left", "peek_right"),
+        ):
+            left_frames = self.manifest["actions"][left_action]["frames"]
+            right_frames = self.manifest["actions"][right_action]["frames"]
+            self.assertEqual(len(left_frames), len(right_frames))
+            for left_rect, right_rect in zip(left_frames, right_frames):
+                lx, ly, lw, lh = left_rect
+                rx, ry, rw, rh = right_rect
+                left = sheet.crop((lx, ly, lx + lw, ly + lh)).transpose(
+                    Image.Transpose.FLIP_LEFT_RIGHT
+                )
+                right = sheet.crop((rx, ry, rx + rw, ry + rh))
+                self.assertIsNone(
+                    ImageChops.difference(left, right).getbbox(),
+                    f"{left_action} 与 {right_action} 不完全镜像",
+                )
+
+    def test_drop_and_landing_return_to_full_character_scale(self) -> None:
+        sheet_path = MANIFEST_PATH.parent / self.manifest["spritesheet"]
+        sheet = Image.open(sheet_path).convert("RGBA")
+        actions = self.manifest["actions"]
+
+        def subject_height(rect: list[int]) -> int:
+            x, y, width, height = rect
+            alpha = sheet.crop((x, y, x + width, y + height)).getchannel("A")
+            left, top, right, bottom = self._dominant_alpha_bounds(alpha)
+            del left, right
+            return bottom - top
+
+        idle_height = subject_height(actions["idle"]["frames"][0])
+        landing_pose_height = subject_height(actions["soft_land"]["frames"][-2])
+        self.assertLessEqual(abs(landing_pose_height - idle_height), 5)
+
+        release_last = subject_height(actions["release_fall"]["frames"][-1])
+        landing_first = subject_height(actions["soft_land"]["frames"][0])
+        # The released hand can touch the headband and merge into the same
+        # alpha component. Compare the visible character region below the hand
+        # rather than treating the hand as part of the pet's height.
+        release_visible_height = min(release_last, 320 - 80)
+        self.assertLessEqual(abs(release_visible_height - landing_first), 20)
+
+        source = PET_APP_PATH.read_text(encoding="utf-8")
+        self.assertIn('("walk_start",)', source)
+        self.assertIn('("walk_stop",)', source)
+        self.assertIn('{"walk", "walk_start", "walk_stop"}', source)
 
     def test_scaling_walking_layer_and_edge_peek_configuration(self) -> None:
         scaling = self.manifest["scaling"]
