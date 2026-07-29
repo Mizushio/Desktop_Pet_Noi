@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
 from PIL import Image, ImageChops
 
+from tools.prepare_action_pack import _alpha_components, _character_core_center_x
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = PROJECT_ROOT / "assets" / "sprite_manifest.json"
 PET_APP_PATH = PROJECT_ROOT / "pet_app.py"
+BUILD_SCRIPT_PATH = PROJECT_ROOT / "build_exe.bat"
+AUDIT_SCRIPT_PATH = PROJECT_ROOT / "tools" / "audit_animation_consistency.py"
 
 
 def png_size(path: Path) -> tuple[int, int]:
@@ -66,6 +73,10 @@ class ProjectTests(unittest.TestCase):
             "sit_sway",
             "curtsey",
             "cheek_puff",
+            "message_notify_enter",
+            "message_notify_hold",
+            "message_notify_exit",
+            "message_notify",
         }
         self.assertTrue(expected <= self.manifest["actions"].keys())
         self.assertNotIn("peek_top", self.manifest["actions"])
@@ -97,7 +108,164 @@ class ProjectTests(unittest.TestCase):
 
     def test_expanded_sheet_dimensions(self) -> None:
         sheet_path = MANIFEST_PATH.parent / self.manifest["spritesheet"]
-        self.assertEqual((1024, 11840), png_size(sheet_path))
+        self.assertEqual((1024, 13120), png_size(sheet_path))
+
+    def test_outfits_cover_the_same_complete_action_atlas(self) -> None:
+        self.assertEqual(16, self.manifest["version"])
+        outfits = self.manifest["outfits"]
+        self.assertEqual(
+            {"classic_maid", "dark_green"},
+            set(outfits),
+        )
+        self.assertEqual("dark_green", self.manifest["default_outfit"])
+
+        for outfit_id, outfit in outfits.items():
+            self.assertTrue(outfit["label"].strip(), outfit_id)
+            sheet_path = MANIFEST_PATH.parent / outfit["spritesheet"]
+            self.assertTrue(sheet_path.is_file(), outfit_id)
+            self.assertEqual((1024, 13120), png_size(sheet_path), outfit_id)
+
+            sheet = Image.open(sheet_path).convert("RGBA")
+            for action_name, action in self.manifest["actions"].items():
+                for x, y, width, height in action["frames"]:
+                    frame = sheet.crop((x, y, x + width, y + height))
+                    self.assertIsNotNone(
+                        frame.getchannel("A").getbbox(),
+                        f"{outfit_id}/{action_name} 存在空白帧",
+                    )
+            for direction, rect in self.manifest["gaze"]["frames"].items():
+                x, y, width, height = rect
+                frame = sheet.crop((x, y, x + width, y + height))
+                self.assertIsNotNone(
+                    frame.getchannel("A").getbbox(),
+                    f"{outfit_id}/gaze/{direction} 存在空白帧",
+                )
+
+    def test_dark_green_outfit_passes_full_visual_audit(self) -> None:
+        environment = os.environ.copy()
+        environment["PET_SPRITESHEET"] = "character_spritesheet_dark_green.png"
+        result = subprocess.run(
+            [sys.executable, str(AUDIT_SCRIPT_PATH)],
+            cwd=PROJECT_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
+    def test_dark_green_cute_and_wave_active_frames_keep_neutral_scale(self) -> None:
+        sheet_path = MANIFEST_PATH.parent / "character_spritesheet_dark_green.png"
+        sheet = Image.open(sheet_path).convert("RGBA")
+        actions = self.manifest["actions"]
+
+        def subject_height(rect: list[int]) -> int:
+            x, y, width, height = rect
+            alpha = sheet.crop((x, y, x + width, y + height)).getchannel("A")
+            left, top, right, bottom = self._dominant_alpha_bounds(alpha)
+            self.assertGreater(right, left)
+            return bottom - top
+
+        def has_only_subject(rect: list[int]) -> bool:
+            x, y, width, height = rect
+            alpha = sheet.crop((x, y, x + width, y + height)).getchannel("A")
+            component_sizes = sorted(
+                (len(component) for component in _alpha_components(alpha)),
+                reverse=True,
+            )
+            if len(component_sizes) < 2:
+                return True
+            return component_sizes[1] <= max(32, round(component_sizes[0] * 0.005))
+
+        idle_height = subject_height(actions["idle"]["frames"][0])
+        self.assertGreaterEqual(idle_height, 258)
+        self.assertLessEqual(idle_height, 264)
+
+        # Exclude the neutral entry/exit frames.  Earlier tests only compared
+        # the tallest frame, so those neutral frames concealed the undersized
+        # hands-on-cheeks and wave drawings.
+        cute_active = actions["click"]["frames"][1:-1]
+        wave_active = actions["wave"]["frames"][1:-1]
+        for action_name, active_frames in (
+            ("click", cute_active),
+            ("wave", wave_active),
+        ):
+            heights = [subject_height(rect) for rect in active_frames]
+            self.assertGreaterEqual(
+                min(heights),
+                idle_height - 7,
+                f"dark_green/{action_name} 仍有明显缩小帧: {heights}",
+            )
+            self.assertLessEqual(
+                max(heights),
+                idle_height + 4,
+                f"dark_green/{action_name} 出现明显放大帧: {heights}",
+            )
+        self.assertTrue(
+            all(has_only_subject(rect) for rect in wave_active),
+            "dark_green/wave 存在与角色分离的跨格残片",
+        )
+
+    def test_both_outfits_keep_wave_head_complete_and_vertically_stable(self) -> None:
+        actions = self.manifest["actions"]
+        for outfit_id, outfit in self.manifest["outfits"].items():
+            sheet = Image.open(
+                MANIFEST_PATH.parent / outfit["spritesheet"]
+            ).convert("RGBA")
+            tops: list[int] = []
+            heights: list[int] = []
+            for frame_index, (x, y, width, height) in enumerate(
+                actions["wave"]["frames"][1:-1],
+                start=1,
+            ):
+                alpha = sheet.crop(
+                    (x, y, x + width, y + height)
+                ).getchannel("A")
+                components = _alpha_components(alpha)
+                self.assertTrue(components, f"{outfit_id}/wave/{frame_index}")
+                subject = max(components, key=len)
+                xs = [point[0] for point in subject]
+                ys = [point[1] for point in subject]
+                top = min(ys)
+                bottom = max(ys) + 1
+                top_xs = [px for px, py in subject if py == top]
+                top_run_width = max(top_xs) - min(top_xs) + 1
+                flat_top_limit = max(
+                    20,
+                    round((max(xs) + 1 - min(xs)) * 0.15),
+                )
+                self.assertLessEqual(
+                    top_run_width,
+                    flat_top_limit,
+                    f"{outfit_id}/wave/{frame_index} 头顶疑似被源格裁切",
+                )
+                self.assertLessEqual(
+                    len(top_xs),
+                    flat_top_limit,
+                    f"{outfit_id}/wave/{frame_index} 头顶存在截断直线",
+                )
+                tops.append(top)
+                heights.append(bottom - top)
+
+            self.assertLessEqual(
+                max(tops) - min(tops),
+                2,
+                f"{outfit_id}/wave 仍有垂直平移: {tops}",
+            )
+            self.assertLessEqual(
+                max(heights) - min(heights),
+                2,
+                f"{outfit_id}/wave 仍有大小波动: {heights}",
+            )
+
+    def test_outfit_switching_is_available_and_packaged(self) -> None:
+        source = PET_APP_PATH.read_text(encoding="utf-8")
+        self.assertIn('menu.addMenu("换装")', source)
+        self.assertIn("def _load_outfit_id(self) -> str:", source)
+        self.assertIn("def _set_outfit(self, outfit_id: str) -> None:", source)
+        self.assertIn('self._settings.setValue("outfit_id", outfit_id)', source)
+        build_script = BUILD_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("character_spritesheet_dark_green.png", build_script)
 
     def test_running_cycle_has_eight_distinct_consistent_frames(self) -> None:
         action = self.manifest["actions"]["walk"]
@@ -159,6 +327,9 @@ class ProjectTests(unittest.TestCase):
             "sit_sway",
             "curtsey",
             "cheek_puff",
+            "message_notify_enter",
+            "message_notify_exit",
+            "message_notify",
         )
         self.assertGreaterEqual(reference_height, 258)
         self.assertLessEqual(reference_height, 262)
@@ -521,6 +692,49 @@ class ProjectTests(unittest.TestCase):
             self.assertLessEqual(max(centers) - min(centers), 1.0, action_name)
             self.assertLessEqual(max(bottoms) - min(bottoms), 0, action_name)
 
+    def test_message_notification_is_ready_for_future_calls(self) -> None:
+        actions = self.manifest["actions"]
+        self.assertFalse(actions["message_notify_enter"]["loop"])
+        self.assertTrue(actions["message_notify_hold"]["loop"])
+        self.assertFalse(actions["message_notify_exit"]["loop"])
+        self.assertFalse(actions["message_notify"]["loop"])
+        self.assertEqual(18, len(actions["message_notify"]["frames"]))
+        self.assertGreaterEqual(
+            sum(actions["message_notify"]["durations_ms"]),
+            7500,
+        )
+        self.assertNotIn(
+            "message_notify",
+            self.manifest["animation"]["tween_actions"],
+        )
+
+        sheet = Image.open(
+            MANIFEST_PATH.parent / self.manifest["spritesheet"]
+        ).convert("RGBA")
+        core_centers: list[float] = []
+        bottoms: list[int] = []
+        heights: list[int] = []
+        for action_name in (
+            "message_notify_enter",
+            "message_notify_hold",
+            "message_notify_exit",
+        ):
+            for x, y, width, height in actions[action_name]["frames"]:
+                alpha = sheet.crop(
+                    (x, y, x + width, y + height)
+                ).getchannel("A")
+                bounds = self._dominant_alpha_bounds(alpha)
+                core_centers.append(_character_core_center_x(alpha))
+                bottoms.append(bounds[3])
+                heights.append(bounds[3] - bounds[1])
+        self.assertLessEqual(max(core_centers) - min(core_centers), 1.5)
+        self.assertLessEqual(max(bottoms) - min(bottoms), 0)
+        self.assertLessEqual(max(heights) - min(heights), 5)
+
+        source = PET_APP_PATH.read_text(encoding="utf-8")
+        self.assertIn("def play_message_notification(self) -> bool:", source)
+        self.assertIn('"预览消息提示动作"', source)
+
     def test_new_character_assets_keep_a_stable_baseline(self) -> None:
         sheet_path = MANIFEST_PATH.parent / self.manifest["spritesheet"]
         sheet = Image.open(sheet_path).convert("RGBA")
@@ -605,6 +819,7 @@ class ProjectTests(unittest.TestCase):
             "sit_sway",
             "curtsey",
             "cheek_puff",
+            "message_notify",
             "time_morning_motion",
             "time_day_motion",
             "time_night_motion",

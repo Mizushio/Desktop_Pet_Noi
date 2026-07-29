@@ -57,6 +57,9 @@ class Action:
 @dataclass(frozen=True)
 class PetConfig:
     spritesheet_path: Path
+    default_outfit: str
+    outfit_labels: dict[str, str]
+    outfit_spritesheet_paths: dict[str, Path]
     frame_size: QSize
     display_size: QSize
     actions: dict[str, Action]
@@ -115,6 +118,31 @@ class PetConfig:
     def load(cls, manifest_path: Path) -> "PetConfig":
         with manifest_path.open("r", encoding="utf-8") as file:
             raw: dict[str, Any] = json.load(file)
+
+        outfits_raw = raw.get("outfits")
+        if not isinstance(outfits_raw, dict) or not outfits_raw:
+            outfits_raw = {
+                "default": {
+                    "label": "默认服装",
+                    "spritesheet": raw["spritesheet"],
+                }
+            }
+        outfit_labels: dict[str, str] = {}
+        outfit_spritesheet_paths: dict[str, Path] = {}
+        for outfit_id, outfit_raw in outfits_raw.items():
+            if not isinstance(outfit_raw, dict):
+                raise ValueError(f"服装 {outfit_id!r} 的配置无效")
+            label = str(outfit_raw.get("label", "")).strip()
+            spritesheet = str(outfit_raw.get("spritesheet", "")).strip()
+            if not label or not spritesheet:
+                raise ValueError(f"服装 {outfit_id!r} 缺少名称或帧表")
+            outfit_labels[str(outfit_id)] = label
+            outfit_spritesheet_paths[str(outfit_id)] = manifest_path.parent / spritesheet
+        default_outfit = str(
+            raw.get("default_outfit", next(iter(outfit_labels)))
+        )
+        if default_outfit not in outfit_labels:
+            raise ValueError(f"默认服装不存在: {default_outfit}")
 
         actions: dict[str, Action] = {}
         for name, action_raw in raw["actions"].items():
@@ -175,6 +203,10 @@ class PetConfig:
             "sit_sway",
             "curtsey",
             "cheek_puff",
+            "message_notify_enter",
+            "message_notify_hold",
+            "message_notify_exit",
+            "message_notify",
         }
         missing = required.difference(actions)
         if missing:
@@ -377,7 +409,10 @@ class PetConfig:
 
         window_layer = raw["window_layer"]
         return cls(
-            spritesheet_path=manifest_path.parent / raw["spritesheet"],
+            spritesheet_path=outfit_spritesheet_paths[default_outfit],
+            default_outfit=default_outfit,
+            outfit_labels=outfit_labels,
+            outfit_spritesheet_paths=outfit_spritesheet_paths,
             frame_size=QSize(*raw["frame_size"]),
             display_size=QSize(*raw["display_size"]),
             actions=actions,
@@ -456,34 +491,51 @@ class PetConfig:
 
 
 class SpriteAtlas:
-    def __init__(self, config: PetConfig) -> None:
-        self._sheet = QPixmap(str(config.spritesheet_path))
-        self._cache: dict[tuple[int, int, int, int, bool], QPixmap] = {}
-        if self._sheet.isNull():
-            raise FileNotFoundError(f"无法读取图片: {config.spritesheet_path}")
+    def __init__(self, config: PetConfig, outfit_id: str) -> None:
+        self._sheets: dict[str, QPixmap] = {}
+        self._cache: dict[tuple[str, int, int, int, int, bool], QPixmap] = {}
+        for candidate_id, spritesheet_path in config.outfit_spritesheet_paths.items():
+            sheet = QPixmap(str(spritesheet_path))
+            if sheet.isNull():
+                raise FileNotFoundError(f"无法读取图片: {spritesheet_path}")
+            self._validate_sheet(sheet, config, candidate_id)
+            self._sheets[candidate_id] = sheet
+        self._outfit_id = ""
+        self.set_outfit(outfit_id)
 
-        sheet_rect = self._sheet.rect()
+    @staticmethod
+    def _validate_sheet(
+        sheet: QPixmap,
+        config: PetConfig,
+        outfit_id: str,
+    ) -> None:
+        sheet_rect = sheet.rect()
         for action_name, action in config.actions.items():
             for frame in action.frames:
                 if not sheet_rect.contains(frame):
                     raise ValueError(
-                        f"{action_name} 的帧 {frame.getRect()} 超出素材范围 "
-                        f"{sheet_rect.getRect()}"
+                        f"{outfit_id}/{action_name} 的帧 {frame.getRect()} "
+                        f"超出素材范围 {sheet_rect.getRect()}"
                     )
         for direction, frame in config.gaze_frames.items():
             if not sheet_rect.contains(frame):
                 raise ValueError(
-                    f"注视方向 {direction} 的帧 {frame.getRect()} 超出素材范围 "
-                    f"{sheet_rect.getRect()}"
+                    f"{outfit_id}/注视方向 {direction} 的帧 "
+                    f"{frame.getRect()} 超出素材范围 {sheet_rect.getRect()}"
                 )
 
+    def set_outfit(self, outfit_id: str) -> None:
+        if outfit_id not in self._sheets:
+            raise ValueError(f"未知服装: {outfit_id}")
+        self._outfit_id = outfit_id
+
     def frame(self, rect: QRect, mirrored: bool = False) -> QPixmap:
-        key = (*rect.getRect(), mirrored)
+        key = (self._outfit_id, *rect.getRect(), mirrored)
         cached = self._cache.get(key)
         if cached is not None:
             return cached
 
-        pixmap = self._sheet.copy(rect)
+        pixmap = self._sheets[self._outfit_id].copy(rect)
         if mirrored:
             pixmap = pixmap.transformed(
                 QTransform().scale(-1.0, 1.0),
@@ -624,8 +676,9 @@ class DesktopPet(QWidget):
 
         manifest_path = resource_path("assets/sprite_manifest.json")
         self._config = PetConfig.load(manifest_path)
-        self._atlas = SpriteAtlas(self._config)
         self._settings = QSettings()
+        self._outfit_id = self._load_outfit_id()
+        self._atlas = SpriteAtlas(self._config, self._outfit_id)
 
         self._action_name = "idle"
         self._frame_index = 0
@@ -905,6 +958,31 @@ class DesktopPet(QWidget):
         interact_action.triggered.connect(self._play_click_interaction)
         menu.addAction(interact_action)
 
+        message_preview_action = QAction("预览消息提示动作", menu)
+        message_preview_action.setEnabled(
+            not self._sleeping
+            and not self._walking
+            and not self._dragging
+            and not self._angry
+            and not self._interaction_active
+            and self._tucked_edge is None
+        )
+        message_preview_action.triggered.connect(self.play_message_notification)
+        menu.addAction(message_preview_action)
+
+        outfit_menu = menu.addMenu("换装")
+        outfit_group = QActionGroup(outfit_menu)
+        outfit_group.setExclusive(True)
+        for outfit_id, label in self._config.outfit_labels.items():
+            outfit_action = QAction(label, outfit_menu)
+            outfit_action.setCheckable(True)
+            outfit_action.setChecked(outfit_id == self._outfit_id)
+            outfit_action.triggered.connect(
+                lambda checked=False, value=outfit_id: self._set_outfit(value)
+            )
+            outfit_group.addAction(outfit_action)
+            outfit_menu.addAction(outfit_action)
+
         stroll_action = QAction("自动偶尔散步", menu)
         stroll_action.setCheckable(True)
         stroll_action.setChecked(self._auto_walk_enabled)
@@ -996,6 +1074,7 @@ class DesktopPet(QWidget):
         self._settings.setValue("gaze_enabled", self._gaze_enabled)
         self._settings.setValue("time_state_enabled", self._time_state_enabled)
         self._settings.setValue("speech_enabled", self._speech_enabled)
+        self._settings.setValue("outfit_id", self._outfit_id)
         self._speech_bubble.close()
         super().closeEvent(event)
 
@@ -1133,6 +1212,32 @@ class DesktopPet(QWidget):
             final_action=None,
             callback=self._finish_click_interaction,
         )
+
+    def play_message_notification(self) -> bool:
+        """Play the prepared notification action; future message code calls this."""
+        if (
+            self._sleeping
+            or self._dragging
+            or self._angry
+            or self._interaction_active
+            or self._tucked_edge is not None
+        ):
+            return False
+        self._cancel_pending_tuck()
+        if self._walking:
+            self._stop_auto_walk(return_to_idle=False, reschedule=False)
+        self._stop_idle_timers()
+        self._interaction_active = True
+        self._play_sequence(
+            ("message_notify",),
+            final_action=None,
+            callback=self._finish_message_notification,
+        )
+        return True
+
+    def _finish_message_notification(self) -> None:
+        self._interaction_active = False
+        self._after_active_action()
 
     def _finish_click_interaction(self) -> None:
         self._interaction_active = False
@@ -1648,6 +1753,24 @@ class DesktopPet(QWidget):
         else:
             self._speech_timer.stop()
             self._speech_bubble.dismiss()
+
+    def _load_outfit_id(self) -> str:
+        saved = str(
+            self._settings.value("outfit_id", self._config.default_outfit)
+        )
+        if saved not in self._config.outfit_labels:
+            return self._config.default_outfit
+        return saved
+
+    def _set_outfit(self, outfit_id: str) -> None:
+        if outfit_id == self._outfit_id:
+            return
+        if outfit_id not in self._config.outfit_labels:
+            raise ValueError(f"未知服装: {outfit_id}")
+        self._atlas.set_outfit(outfit_id)
+        self._outfit_id = outfit_id
+        self._settings.setValue("outfit_id", outfit_id)
+        self.update()
 
     def _load_bool_setting(self, key: str, default: bool) -> bool:
         saved = self._settings.value(key)

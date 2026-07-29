@@ -18,6 +18,7 @@ if errorlevel 1 goto :error
     --name "MizushioDesktopPet" ^
     --icon "assets\pet.ico" ^
     --add-data "assets\character_spritesheet.png;assets" ^
+    --add-data "assets\character_spritesheet_dark_green.png;assets" ^
     --add-data "assets\sprite_manifest.json;assets" ^
     main.py
 if errorlevel 1 goto :error
