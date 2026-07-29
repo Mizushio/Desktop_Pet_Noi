@@ -10,12 +10,13 @@ from prepare_action_pack import ATLAS_ROWS, OUTFIT_OUTPUT_PATHS, _outfit_source_
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT = PROJECT_ROOT.parent / "WindowsDesktopPet_v0.16.zip"
+DEFAULT_OUTPUT = PROJECT_ROOT.parent / "WindowsDesktopPet_v0.17.zip"
 
 ROOT_FILES = (
     ".gitignore",
     "README.md",
     "build_exe.bat",
+    "circle_gesture.py",
     "main.py",
     "pet_app.py",
     "requirements-build.txt",

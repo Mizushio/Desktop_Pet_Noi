@@ -49,6 +49,10 @@ OUTFIT_ROW_TARGET_SUBJECT_HEIGHTS: dict[tuple[str, int], int] = {
     ("classic_maid", 6): 260,
     ("dark_green", 5): 261,
     ("dark_green", 6): 261,
+    ("classic_maid", 41): 260,
+    ("classic_maid", 42): 260,
+    ("dark_green", 41): 261,
+    ("dark_green", 42): 261,
 }
 
 CELL_WIDTH = 256
@@ -147,6 +151,22 @@ ATLAS_ROWS = (
     AtlasRow("character_message_actions.png", 1, "effect", scale=0.975),
     AtlasRow("character_message_actions.png", 2, "effect", scale=0.975),
     AtlasRow("character_message_actions.png", 3, "effect", scale=0.975),
+    # Cursor-circle dizziness.  The floating stars must not move the character
+    # anchor, and both rows use the same standing-height target as neutral.
+    AtlasRow(
+        "character_dizzy_actions.png",
+        0,
+        "effect",
+        source_rows=2,
+        scale=0.62,
+    ),
+    AtlasRow(
+        "character_dizzy_actions.png",
+        1,
+        "effect",
+        source_rows=2,
+        scale=0.62,
+    ),
 )
 
 

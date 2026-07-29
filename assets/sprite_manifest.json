@@ -1,5 +1,5 @@
 {
-  "version": 16,
+  "version": 17,
   "spritesheet": "character_spritesheet.png",
   "default_outfit": "dark_green",
   "outfits": {
@@ -524,6 +524,22 @@
         320, 320, 360, 420, 500, 420, 460, 520, 650,
         620, 540, 620, 540, 520, 520, 560, 620, 380
       ]
+    },
+    "dizzy": {
+      "loop": false,
+      "frames": [
+        [0, 0, 256, 320],
+        [0, 13120, 256, 320],
+        [256, 13120, 256, 320],
+        [512, 13120, 256, 320],
+        [768, 13120, 256, 320],
+        [0, 13440, 256, 320],
+        [256, 13440, 256, 320],
+        [512, 13440, 256, 320],
+        [768, 13440, 256, 320],
+        [0, 0, 256, 320]
+      ],
+      "durations_ms": [180, 260, 280, 300, 520, 850, 600, 560, 720, 420]
     }
   },
   "movement": {
@@ -581,6 +597,14 @@
     "spontaneous_delay_ms": [12000, 26000],
     "duration_ms": [3200, 6200],
     "click_follow_duration_ms": 5200,
+    "circle_gesture": {
+      "turns": 2.0,
+      "min_radius_px": 70,
+      "max_sample_gap_ms": 450,
+      "max_step_degrees": 100,
+      "reverse_tolerance_degrees": 80,
+      "dizzy_cooldown_ms": 10000
+    },
     "frames": {
       "left": [0, 8000, 256, 320],
       "upper_left": [768, 8000, 256, 320],

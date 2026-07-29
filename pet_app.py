@@ -40,6 +40,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
+from circle_gesture import CircleGestureTracker
+
 
 def resource_path(relative_path: str) -> Path:
     """Return a resource path in source mode and in a PyInstaller bundle."""
@@ -93,6 +95,12 @@ class PetConfig:
     gaze_spontaneous_delay_ms: tuple[int, int]
     gaze_duration_ms: tuple[int, int]
     gaze_click_follow_duration_ms: int
+    gaze_circle_turns: float
+    gaze_circle_min_radius_px: int
+    gaze_circle_max_sample_gap_ms: int
+    gaze_circle_max_step_degrees: float
+    gaze_circle_reverse_tolerance_degrees: float
+    gaze_dizzy_cooldown_ms: int
     gaze_frames: dict[str, QRect]
     time_state_enabled_default: bool
     time_state_check_interval_ms: int
@@ -207,6 +215,7 @@ class PetConfig:
             "message_notify_hold",
             "message_notify_exit",
             "message_notify",
+            "dizzy",
         }
         missing = required.difference(actions)
         if missing:
@@ -320,6 +329,27 @@ class PetConfig:
                 raise ValueError(f"{label} 应为两个递增的正整数")
         if int(gaze["click_follow_duration_ms"]) <= 0:
             raise ValueError("gaze.click_follow_duration_ms 必须大于 0")
+        circle_gesture = gaze["circle_gesture"]
+        if float(circle_gesture["turns"]) < 1.0:
+            raise ValueError("gaze.circle_gesture.turns 至少为 1")
+        if int(circle_gesture["min_radius_px"]) <= 0:
+            raise ValueError("gaze.circle_gesture.min_radius_px 必须大于 0")
+        if int(circle_gesture["max_sample_gap_ms"]) <= int(gaze["poll_interval_ms"]):
+            raise ValueError(
+                "gaze.circle_gesture.max_sample_gap_ms 必须大于注视采样间隔"
+            )
+        if not 0 < float(circle_gesture["max_step_degrees"]) < 180:
+            raise ValueError(
+                "gaze.circle_gesture.max_step_degrees 必须在 0～180 之间"
+            )
+        if float(circle_gesture["reverse_tolerance_degrees"]) < 0:
+            raise ValueError(
+                "gaze.circle_gesture.reverse_tolerance_degrees 不能小于 0"
+            )
+        if int(circle_gesture["dizzy_cooldown_ms"]) <= 0:
+            raise ValueError(
+                "gaze.circle_gesture.dizzy_cooldown_ms 必须大于 0"
+            )
 
         time_state = raw["time_state"]
         time_visual_actions = {
@@ -452,6 +482,18 @@ class PetConfig:
             ),
             gaze_duration_ms=(gaze_duration[0], gaze_duration[1]),
             gaze_click_follow_duration_ms=int(gaze["click_follow_duration_ms"]),
+            gaze_circle_turns=float(circle_gesture["turns"]),
+            gaze_circle_min_radius_px=int(circle_gesture["min_radius_px"]),
+            gaze_circle_max_sample_gap_ms=int(
+                circle_gesture["max_sample_gap_ms"]
+            ),
+            gaze_circle_max_step_degrees=float(
+                circle_gesture["max_step_degrees"]
+            ),
+            gaze_circle_reverse_tolerance_degrees=float(
+                circle_gesture["reverse_tolerance_degrees"]
+            ),
+            gaze_dizzy_cooldown_ms=int(circle_gesture["dizzy_cooldown_ms"]),
             gaze_frames=gaze_frames,
             time_state_enabled_default=bool(time_state["enabled_default"]),
             time_state_check_interval_ms=int(time_state["check_interval_ms"]),
@@ -698,6 +740,15 @@ class DesktopPet(QWidget):
         self._gaze_direction: str | None = None
         self._gaze_active_until = 0.0
         self._next_gaze_at = time.monotonic()
+        self._circle_gesture = CircleGestureTracker(
+            required_turns=self._config.gaze_circle_turns,
+            max_sample_gap_ms=self._config.gaze_circle_max_sample_gap_ms,
+            max_step_degrees=self._config.gaze_circle_max_step_degrees,
+            reverse_tolerance_degrees=(
+                self._config.gaze_circle_reverse_tolerance_degrees
+            ),
+        )
+        self._dizzy_cooldown_until = 0.0
         self._scale_percent = self._load_scale_percent()
         self._auto_walk_enabled = self._load_auto_walk_enabled()
         self._sleep_enabled = self._load_sleep_enabled()
@@ -970,6 +1021,18 @@ class DesktopPet(QWidget):
         message_preview_action.triggered.connect(self.play_message_notification)
         menu.addAction(message_preview_action)
 
+        dizzy_preview_action = QAction("预览晕头转向动作", menu)
+        dizzy_preview_action.setEnabled(
+            not self._sleeping
+            and not self._walking
+            and not self._dragging
+            and not self._angry
+            and not self._interaction_active
+            and self._tucked_edge is None
+        )
+        dizzy_preview_action.triggered.connect(self.play_dizzy_reaction)
+        menu.addAction(dizzy_preview_action)
+
         outfit_menu = menu.addMenu("换装")
         outfit_group = QActionGroup(outfit_menu)
         outfit_group.setExclusive(True)
@@ -1237,6 +1300,38 @@ class DesktopPet(QWidget):
 
     def _finish_message_notification(self) -> None:
         self._interaction_active = False
+        self._after_active_action()
+
+    def play_dizzy_reaction(self) -> bool:
+        """Play the dizzy reaction used by the two-circle cursor gesture."""
+        if (
+            self._sleeping
+            or self._walking
+            or self._dragging
+            or self._angry
+            or self._interaction_active
+            or self._tucked_edge is not None
+        ):
+            return False
+        self._circle_gesture.reset()
+        self._gaze_active_until = 0.0
+        self._gaze_direction = None
+        self._dizzy_cooldown_until = (
+            time.monotonic() + self._config.gaze_dizzy_cooldown_ms / 1000.0
+        )
+        self._cancel_pending_tuck()
+        self._stop_idle_timers()
+        self._interaction_active = True
+        self._play_sequence(
+            ("dizzy",),
+            final_action=None,
+            callback=self._finish_dizzy_reaction,
+        )
+        return True
+
+    def _finish_dizzy_reaction(self) -> None:
+        self._interaction_active = False
+        self._schedule_next_spontaneous_gaze()
         self._after_active_action()
 
     def _finish_click_interaction(self) -> None:
@@ -1587,6 +1682,7 @@ class DesktopPet(QWidget):
 
     def _update_gaze(self) -> None:
         direction: str | None = None
+        sampled_circle = False
         now = time.monotonic()
         eligible = (
             self._gaze_enabled
@@ -1631,7 +1727,35 @@ class DesktopPet(QWidget):
                         "upper_right",
                     )
                     direction = sectors[int((angle + 22.5) // 45.0) % 8]
+                if now >= self._dizzy_cooldown_until:
+                    sampled_circle = True
+                    min_radius = (
+                        self._config.gaze_circle_min_radius_px
+                        * self._scale_percent
+                        / 100.0
+                    )
+                    dizzy = self._circle_gesture.sample(
+                        dx,
+                        dy,
+                        now=now,
+                        min_radius_px=min_radius,
+                    )
+                    if self._circle_gesture.rotation_degrees > 0:
+                        # Do not let a currently progressing orbit lose the
+                        # short-lived gaze state between two adjacent samples.
+                        grace_seconds = (
+                            self._config.gaze_circle_max_sample_gap_ms / 1000.0
+                            + 0.15
+                        )
+                        self._gaze_active_until = max(
+                            self._gaze_active_until,
+                            now + grace_seconds,
+                        )
+                    if dizzy and self.play_dizzy_reaction():
+                        return
 
+        if not sampled_circle:
+            self._circle_gesture.reset()
         if direction != self._gaze_direction:
             self._gaze_direction = direction
             self.update()
@@ -1666,6 +1790,7 @@ class DesktopPet(QWidget):
         else:
             self._gaze_active_until = 0.0
             self._gaze_direction = None
+            self._circle_gesture.reset()
             self.update()
 
     def _record_click_and_maybe_anger(self) -> bool:

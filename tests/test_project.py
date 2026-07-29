@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import struct
 import subprocess
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from PIL import Image, ImageChops
 
+from circle_gesture import CircleGestureTracker
 from tools.prepare_action_pack import _alpha_components, _character_core_center_x
 
 
@@ -77,6 +79,7 @@ class ProjectTests(unittest.TestCase):
             "message_notify_hold",
             "message_notify_exit",
             "message_notify",
+            "dizzy",
         }
         self.assertTrue(expected <= self.manifest["actions"].keys())
         self.assertNotIn("peek_top", self.manifest["actions"])
@@ -108,10 +111,10 @@ class ProjectTests(unittest.TestCase):
 
     def test_expanded_sheet_dimensions(self) -> None:
         sheet_path = MANIFEST_PATH.parent / self.manifest["spritesheet"]
-        self.assertEqual((1024, 13120), png_size(sheet_path))
+        self.assertEqual((1024, 13760), png_size(sheet_path))
 
     def test_outfits_cover_the_same_complete_action_atlas(self) -> None:
-        self.assertEqual(16, self.manifest["version"])
+        self.assertEqual(17, self.manifest["version"])
         outfits = self.manifest["outfits"]
         self.assertEqual(
             {"classic_maid", "dark_green"},
@@ -123,7 +126,7 @@ class ProjectTests(unittest.TestCase):
             self.assertTrue(outfit["label"].strip(), outfit_id)
             sheet_path = MANIFEST_PATH.parent / outfit["spritesheet"]
             self.assertTrue(sheet_path.is_file(), outfit_id)
-            self.assertEqual((1024, 13120), png_size(sheet_path), outfit_id)
+            self.assertEqual((1024, 13760), png_size(sheet_path), outfit_id)
 
             sheet = Image.open(sheet_path).convert("RGBA")
             for action_name, action in self.manifest["actions"].items():
@@ -617,6 +620,15 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(2, len(gaze["spontaneous_delay_ms"]))
         self.assertEqual(2, len(gaze["duration_ms"]))
         self.assertGreater(gaze["click_follow_duration_ms"], 0)
+        circle = gaze["circle_gesture"]
+        self.assertEqual(2.0, circle["turns"])
+        self.assertGreater(circle["min_radius_px"], 0)
+        self.assertGreater(
+            circle["max_sample_gap_ms"],
+            gaze["poll_interval_ms"],
+        )
+        self.assertLess(circle["max_step_degrees"], 180)
+        self.assertGreater(circle["dizzy_cooldown_ms"], 0)
         self.assertEqual(
             {
                 "left",
@@ -640,7 +652,10 @@ class ProjectTests(unittest.TestCase):
             {"morning", "day", "night"},
             set(time_state["visual_actions"]),
         )
-        self.assertTrue(set(time_state["visual_actions"].values()) <= set(self.manifest["actions"]))
+        self.assertTrue(
+            set(time_state["visual_actions"].values())
+            <= set(self.manifest["actions"])
+        )
         self.assertEqual(
             {"idle"},
             set(time_state["visual_actions"].values()),
@@ -670,6 +685,77 @@ class ProjectTests(unittest.TestCase):
             "angry",
         ):
             self.assertTrue(speech["phrases"][phase])
+
+    def test_circle_tracker_accepts_both_directions_and_rejects_wobble(self) -> None:
+        def completes_circle(direction: int) -> bool:
+            tracker = CircleGestureTracker(required_turns=2.0)
+            triggered = False
+            for index in range(74):
+                angle = math.radians(direction * index * 10)
+                triggered = tracker.sample(
+                    160 * math.cos(angle),
+                    160 * math.sin(angle),
+                    now=index * 0.1,
+                    min_radius_px=70,
+                )
+                if triggered:
+                    break
+            return triggered
+
+        self.assertTrue(completes_circle(1))
+        self.assertTrue(completes_circle(-1))
+
+        tracker = CircleGestureTracker(required_turns=2.0)
+        triggered = False
+        for index in range(120):
+            angle = math.radians(25 if index % 2 else -25)
+            triggered = tracker.sample(
+                160 * math.cos(angle),
+                160 * math.sin(angle),
+                now=index * 0.1,
+                min_radius_px=70,
+            )
+            self.assertFalse(triggered)
+        self.assertLess(tracker.progress, 0.2)
+
+    def test_dizzy_action_and_assets_are_stable_for_both_outfits(self) -> None:
+        action = self.manifest["actions"]["dizzy"]
+        self.assertFalse(action["loop"])
+        self.assertEqual(10, len(action["frames"]))
+        self.assertGreaterEqual(sum(action["durations_ms"]), 4000)
+        self.assertNotIn("dizzy", self.manifest["animation"]["tween_actions"])
+
+        for outfit in self.manifest["outfits"].values():
+            sheet = Image.open(
+                MANIFEST_PATH.parent / outfit["spritesheet"]
+            ).convert("RGBA")
+            subject_heights: list[int] = []
+            subject_bottoms: list[int] = []
+            core_centers: list[float] = []
+            top_margins: list[int] = []
+            for x, y, width, height in action["frames"][1:-1]:
+                alpha = sheet.crop(
+                    (x, y, x + width, y + height)
+                ).getchannel("A")
+                left, top, right, bottom = self._dominant_alpha_bounds(alpha)
+                del left, right
+                subject_heights.append(bottom - top)
+                subject_bottoms.append(bottom)
+                core_centers.append(_character_core_center_x(alpha))
+                alpha_bounds = alpha.getbbox()
+                self.assertIsNotNone(alpha_bounds)
+                assert alpha_bounds is not None
+                top_margins.append(alpha_bounds[1])
+            # A connected star-ring can extend the dominant alpha component
+            # by a few pixels without changing the character's body scale.
+            self.assertLessEqual(max(subject_heights) - min(subject_heights), 5)
+            self.assertEqual(0, max(subject_bottoms) - min(subject_bottoms))
+            self.assertLessEqual(max(core_centers) - min(core_centers), 1.5)
+            self.assertGreaterEqual(min(top_margins), 20)
+
+        source = PET_APP_PATH.read_text(encoding="utf-8")
+        self.assertIn("def play_dizzy_reaction(self) -> bool:", source)
+        self.assertIn('"预览晕头转向动作"', source)
 
     def test_new_cute_actions_are_slow_and_stably_anchored(self) -> None:
         sheet_path = MANIFEST_PATH.parent / self.manifest["spritesheet"]
@@ -820,6 +906,7 @@ class ProjectTests(unittest.TestCase):
             "curtsey",
             "cheek_puff",
             "message_notify",
+            "dizzy",
             "time_morning_motion",
             "time_day_motion",
             "time_night_motion",
