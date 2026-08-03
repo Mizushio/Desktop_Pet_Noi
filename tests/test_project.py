@@ -900,7 +900,19 @@ class ProjectTests(unittest.TestCase):
             self.assertNotIn(forbidden, source)
             self.assertNotIn(forbidden, package_script)
         self.assertNotIn("plugins\\adarkroom_native", build_script)
-        self.assertIn("完整移除黑暗房间游戏功能", readme)
+        self.assertIn("不包含已废弃的实验性游戏模块", readme)
+
+    def test_formal_release_version_is_consistent(self) -> None:
+        main_source = (PROJECT_ROOT / "main.py").read_text(encoding="utf-8")
+        package_source = (
+            PROJECT_ROOT / "tools" / "package_release.py"
+        ).read_text(encoding="utf-8")
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn('APP_VERSION = "1.0.0"', main_source)
+        self.assertIn("setApplicationVersion(APP_VERSION)", main_source)
+        self.assertIn("WindowsDesktopPet_v1.0.zip", package_source)
+        self.assertIn("# Mizushio Desktop Pet v1.0", readme)
 
     def test_optional_monitor_is_config_presence_driven_and_hidden_when_absent(
         self,

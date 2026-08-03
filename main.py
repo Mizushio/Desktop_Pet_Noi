@@ -9,11 +9,15 @@ from PySide6.QtWidgets import QApplication
 from pet_app import DesktopPet
 
 
+APP_VERSION = "1.0.0"
+
+
 def main() -> int:
     multiprocessing.freeze_support()
 
     QCoreApplication.setOrganizationName("Mizushio")
     QCoreApplication.setApplicationName("DesktopPet")
+    QCoreApplication.setApplicationVersion(APP_VERSION)
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )

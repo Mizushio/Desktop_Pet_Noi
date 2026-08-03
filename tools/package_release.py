@@ -7,7 +7,7 @@ import zipfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT = PROJECT_ROOT.parent / "WindowsDesktopPet_v0.27_clean.zip"
+DEFAULT_OUTPUT = PROJECT_ROOT.parent / "WindowsDesktopPet_v1.0.zip"
 
 ROOT_FILES = (
     ".gitignore",
