@@ -21,6 +21,7 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QTimer,
+    QUrl,
 )
 from PySide6.QtGui import (
     QAction,
@@ -29,6 +30,7 @@ from PySide6.QtGui import (
     QCloseEvent,
     QContextMenuEvent,
     QCursor,
+    QDesktopServices,
     QFont,
     QFontMetrics,
     QMouseEvent,
@@ -38,8 +40,23 @@ from PySide6.QtGui import (
     QTransform,
     QWheelEvent,
 )
-from PySide6.QtWidgets import QApplication, QMenu, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QMenu,
+    QPlainTextEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
+from optional_payload import (
+    ChatMonitorConfig,
+    MessageRecord,
+    private_chat_config_path,
+)
+from optional_runtime import ChatMonitor
 from circle_gesture import CircleGestureTracker
 
 
@@ -710,6 +727,142 @@ class SpeechBubble(QWidget):
         )
 
 
+class MessagePopup(QWidget):
+    WIDTH = 380
+
+    def __init__(self, owner: "DesktopPet", site_url: str) -> None:
+        super().__init__(None)
+        self._owner = owner
+        self._site_url = site_url
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+
+        self.setWindowTitle("桌宠新消息")
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setFixedWidth(self.WIDTH)
+        self.setStyleSheet(
+            """
+            MessagePopup {
+                background: rgba(250, 252, 249, 248);
+                border: 1px solid rgba(62, 87, 75, 205);
+                border-radius: 13px;
+            }
+            QLabel#messageTitle {
+                color: #23382f;
+                font: 600 11pt "Microsoft YaHei UI";
+            }
+            QPlainTextEdit#messageBody {
+                color: #293b34;
+                font: 10pt "Microsoft YaHei UI";
+                background: rgba(234, 241, 236, 210);
+                border: 0;
+                border-radius: 8px;
+                padding: 10px;
+            }
+            QPushButton {
+                min-height: 27px;
+                padding: 2px 12px;
+                border: 1px solid #90aa9d;
+                border-radius: 7px;
+                color: #294238;
+                background: #f7faf8;
+            }
+            QPushButton:hover {
+                background: #e4efe9;
+            }
+            """
+        )
+
+        self._title = QLabel("收到新消息")
+        self._title.setObjectName("messageTitle")
+        self._body = QPlainTextEdit()
+        self._body.setObjectName("messageBody")
+        self._body.setReadOnly(True)
+        self._body.setFixedHeight(220)
+        self._body.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+
+        self._open_button = QPushButton("打开聊天网页")
+        self._open_button.setVisible(bool(site_url))
+        self._open_button.clicked.connect(self._open_site)
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.dismiss)
+
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        buttons.addStretch(1)
+        buttons.addWidget(self._open_button)
+        buttons.addWidget(close_button)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 13)
+        layout.setSpacing(10)
+        layout.addWidget(self._title)
+        layout.addWidget(self._body)
+        layout.addLayout(buttons)
+
+    def show_messages(
+        self,
+        records: list[MessageRecord],
+        *,
+        duration_ms: int,
+        max_messages: int,
+        max_characters: int,
+    ) -> None:
+        if not records:
+            return
+        visible_records = records[-max_messages:]
+        hidden_count = len(records) - len(visible_records)
+        sections = [
+            record.display_text(max_characters) for record in visible_records
+        ]
+        if hidden_count:
+            sections.insert(0, f"另有 {hidden_count} 条新消息")
+        self._title.setText(
+            "收到新消息" if len(records) == 1 else f"收到 {len(records)} 条新消息"
+        )
+        self._body.setPlainText("\n\n".join(sections))
+        self._body.verticalScrollBar().setValue(0)
+        self.adjustSize()
+        self.reposition()
+        self.show()
+        self.raise_()
+        self._hide_timer.start(duration_ms)
+
+    def dismiss(self) -> None:
+        self._hide_timer.stop()
+        self.hide()
+
+    def reposition(self) -> None:
+        screen = (
+            QApplication.screenAt(self._owner.frameGeometry().center())
+            or self._owner.screen()
+            or QApplication.primaryScreen()
+        )
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        owner_rect = self._owner.frameGeometry()
+        gap = 12
+        x = owner_rect.left() - self.width() - gap
+        if x < area.left():
+            x = owner_rect.right() + gap
+        if x + self.width() - 1 > area.right():
+            x = area.right() - self.width() + 1
+        y = owner_rect.bottom() - self.height()
+        y = min(max(y, area.top()), area.bottom() - self.height() + 1)
+        self.move(x, y)
+
+    def _open_site(self) -> None:
+        if self._site_url:
+            QDesktopServices.openUrl(QUrl(self._site_url))
+
+
 class DesktopPet(QWidget):
     DRAG_THRESHOLD = 4
 
@@ -721,6 +874,16 @@ class DesktopPet(QWidget):
         self._settings = QSettings()
         self._outfit_id = self._load_outfit_id()
         self._atlas = SpriteAtlas(self._config, self._outfit_id)
+        self._chat_config: ChatMonitorConfig | None = None
+        self._chat_monitor: ChatMonitor | None = None
+        self._chat_status = ""
+        private_config_path = private_chat_config_path()
+        if private_config_path.is_file():
+            try:
+                self._chat_config = ChatMonitorConfig.load(private_config_path)
+                self._chat_status = "等待启动"
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                self._chat_config = None
 
         self._action_name = "idle"
         self._frame_index = 0
@@ -783,6 +946,22 @@ class DesktopPet(QWidget):
         self._apply_window_layer_flags()
         self.setFixedSize(self._scaled_full_size())
         self._speech_bubble = SpeechBubble(self)
+        self._message_popup: MessagePopup | None = None
+        if self._chat_config is not None:
+            self._message_popup = MessagePopup(self, self._chat_config.site_url)
+        self._message_animation_pending = False
+        self._message_animation_retry_timer = QTimer(self)
+        self._message_animation_retry_timer.setSingleShot(True)
+        self._message_animation_retry_timer.setInterval(1000)
+        self._message_animation_retry_timer.timeout.connect(
+            self._try_pending_message_animation
+        )
+        if self._chat_config is not None:
+            self._chat_monitor = ChatMonitor(self._chat_config, self)
+            self._chat_monitor.new_messages.connect(self._on_chat_messages)
+            self._chat_monitor.status_changed.connect(
+                self._on_chat_status_changed
+            )
 
         self._animation_timer = QTimer(self)
         self._animation_timer.setTimerType(Qt.TimerType.PreciseTimer)
@@ -853,6 +1032,8 @@ class DesktopPet(QWidget):
         self._schedule_auto_walk()
         self._schedule_sleep()
         self._schedule_speech()
+        if self._chat_monitor is not None:
+            QTimer.singleShot(0, self._chat_monitor.start)
 
     def sizeHint(self) -> QSize:
         return self._scaled_full_size()
@@ -902,11 +1083,15 @@ class DesktopPet(QWidget):
         super().moveEvent(event)
         if hasattr(self, "_speech_bubble") and self._speech_bubble.isVisible():
             self._speech_bubble.reposition()
+        if self._message_popup is not None and self._message_popup.isVisible():
+            self._message_popup.reposition()
 
     def resizeEvent(self, event: object) -> None:
         super().resizeEvent(event)
         if hasattr(self, "_speech_bubble") and self._speech_bubble.isVisible():
             self._speech_bubble.reposition()
+        if self._message_popup is not None and self._message_popup.isVisible():
+            self._message_popup.reposition()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1097,6 +1282,16 @@ class DesktopPet(QWidget):
         speak_now_action.triggered.connect(self._speak_now)
         menu.addAction(speak_now_action)
 
+        if self._chat_monitor is not None:
+            menu.addSeparator()
+            chat_status_action = QAction(f"消息连接：{self._chat_status}", menu)
+            chat_status_action.setEnabled(False)
+            menu.addAction(chat_status_action)
+
+            open_chat_action = QAction("打开聊天网页", menu)
+            open_chat_action.triggered.connect(self._open_chat_page)
+            menu.addAction(open_chat_action)
+
         size_menu = menu.addMenu("桌宠大小")
         size_group = QActionGroup(size_menu)
         size_group.setExclusive(True)
@@ -1138,7 +1333,12 @@ class DesktopPet(QWidget):
         self._settings.setValue("time_state_enabled", self._time_state_enabled)
         self._settings.setValue("speech_enabled", self._speech_enabled)
         self._settings.setValue("outfit_id", self._outfit_id)
+        if self._chat_monitor is not None:
+            self._chat_monitor.stop()
+        self._message_animation_retry_timer.stop()
         self._speech_bubble.close()
+        if self._message_popup is not None:
+            self._message_popup.close()
         super().closeEvent(event)
 
     def toggle_walking(self) -> None:
@@ -1277,13 +1477,14 @@ class DesktopPet(QWidget):
         )
 
     def play_message_notification(self) -> bool:
-        """Play the prepared notification action; future message code calls this."""
+        """Play the prepared notification action for a newly received message."""
         if (
             self._sleeping
             or self._dragging
             or self._angry
             or self._interaction_active
             or self._tucked_edge is not None
+            or (not self._is_base_action() and not self._walking)
         ):
             return False
         self._cancel_pending_tuck()
@@ -1301,6 +1502,51 @@ class DesktopPet(QWidget):
     def _finish_message_notification(self) -> None:
         self._interaction_active = False
         self._after_active_action()
+        if self._message_animation_pending:
+            self._message_animation_retry_timer.start(350)
+
+    def _on_chat_messages(self, records: object) -> None:
+        if (
+            self._chat_config is None
+            or self._message_popup is None
+            or not isinstance(records, list)
+        ):
+            return
+        messages = [
+            record for record in records if isinstance(record, MessageRecord)
+        ]
+        if not messages:
+            return
+        self._speech_bubble.dismiss()
+        self._message_popup.show_messages(
+            messages,
+            duration_ms=self._chat_config.popup_duration_seconds * 1000,
+            max_messages=self._chat_config.max_popup_messages,
+            max_characters=self._chat_config.max_message_characters,
+        )
+        self._message_animation_pending = True
+        self._try_pending_message_animation()
+
+    def _try_pending_message_animation(self) -> None:
+        if not self._message_animation_pending:
+            return
+        if self._sleeping:
+            self._wake_from_sleep()
+            self._message_animation_retry_timer.start()
+            return
+        if self._tucked_edge is not None:
+            self._restore_from_tuck(play_interaction=False)
+        if self.play_message_notification():
+            self._message_animation_pending = False
+            return
+        self._message_animation_retry_timer.start()
+
+    def _on_chat_status_changed(self, status: str) -> None:
+        self._chat_status = status
+
+    def _open_chat_page(self) -> None:
+        if self._chat_config is not None:
+            QDesktopServices.openUrl(QUrl(self._chat_config.site_url))
 
     def play_dizzy_reaction(self) -> bool:
         """Play the dizzy reaction used by the two-circle cursor gesture."""

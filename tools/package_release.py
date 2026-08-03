@@ -6,11 +6,8 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from prepare_action_pack import ATLAS_ROWS, OUTFIT_OUTPUT_PATHS, _outfit_source_name
-
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT = PROJECT_ROOT.parent / "WindowsDesktopPet_v0.17.zip"
+DEFAULT_OUTPUT = PROJECT_ROOT.parent / "WindowsDesktopPet_v0.27_clean.zip"
 
 ROOT_FILES = (
     ".gitignore",
@@ -18,6 +15,8 @@ ROOT_FILES = (
     "build_exe.bat",
     "circle_gesture.py",
     "main.py",
+    "optional_payload.py",
+    "optional_runtime.py",
     "pet_app.py",
     "requirements-build.txt",
     "requirements-tools.txt",
@@ -31,6 +30,8 @@ TOOL_FILES = (
 )
 TEST_FILES = ("tests/test_project.py",)
 RUNTIME_ASSETS = (
+    "assets/character_spritesheet.png",
+    "assets/character_spritesheet_dark_green.png",
     "assets/pet.ico",
     "assets/sprite_manifest.json",
 )
@@ -43,14 +44,9 @@ def release_files() -> list[Path]:
         *(Path(name) for name in TEST_FILES),
         *(Path(name) for name in RUNTIME_ASSETS),
     }
-
-    for output_path in OUTFIT_OUTPUT_PATHS.values():
-        relative_paths.add(output_path.relative_to(PROJECT_ROOT))
-    for outfit_id in OUTFIT_OUTPUT_PATHS:
-        for row in ATLAS_ROWS:
-            relative_paths.add(
-                Path("assets") / _outfit_source_name(row.source_name, outfit_id)
-            )
+    private_config = Path("desktop_pet.private.json")
+    if (PROJECT_ROOT / private_config).is_file():
+        relative_paths.add(private_config)
 
     files = sorted(relative_paths)
     missing = [path for path in files if not (PROJECT_ROOT / path).is_file()]
@@ -96,7 +92,7 @@ def verify_archive(output_path: Path, files: list[Path]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="创建仅含运行及帧表重建所需文件的桌宠发布包"
+        description="创建仅含运行、测试和精简素材所需文件的桌宠发布包"
     )
     parser.add_argument(
         "--output",

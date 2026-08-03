@@ -23,6 +23,11 @@ if errorlevel 1 goto :error
     main.py
 if errorlevel 1 goto :error
 
+if exist "desktop_pet.private.json" (
+    copy /Y "desktop_pet.private.json" "dist\desktop_pet.private.json" >nul
+)
+if exist "dist\plugins" rmdir /S /Q "dist\plugins"
+if exist "dist\THIRD_PARTY_NOTICES.md" del /Q "dist\THIRD_PARTY_NOTICES.md"
 echo.
 echo 打包完成：dist\MizushioDesktopPet.exe
 pause

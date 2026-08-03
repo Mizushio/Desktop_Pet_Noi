@@ -12,6 +12,7 @@ from pathlib import Path
 from PIL import Image, ImageChops
 
 from circle_gesture import CircleGestureTracker
+from optional_payload import MessageSnapshotTracker, extract_message_records
 from tools.prepare_action_pack import _alpha_components, _character_core_center_x
 
 
@@ -114,7 +115,7 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual((1024, 13760), png_size(sheet_path))
 
     def test_outfits_cover_the_same_complete_action_atlas(self) -> None:
-        self.assertEqual(17, self.manifest["version"])
+        self.assertEqual(18, self.manifest["version"])
         outfits = self.manifest["outfits"]
         self.assertEqual(
             {"classic_maid", "dark_green"},
@@ -820,6 +821,113 @@ class ProjectTests(unittest.TestCase):
         source = PET_APP_PATH.read_text(encoding="utf-8")
         self.assertIn("def play_message_notification(self) -> bool:", source)
         self.assertIn('"预览消息提示动作"', source)
+
+    def test_chat_api_messages_are_normalized_and_deduplicated(self) -> None:
+        initial_payload = {
+            "ok": True,
+            "data": [
+                {
+                    "id": 10,
+                    "send_user": "A",
+                    "msg": "旧消息",
+                    "send_time": "2026-07-29 12:00:00",
+                }
+            ],
+        }
+        next_payload = {
+            "ok": True,
+            "data": [
+                *initial_payload["data"],
+                {
+                    "id": 11,
+                    "sender": {"name": "B"},
+                    "content": "新消息",
+                    "created_at": "2026-07-29 12:01:00",
+                },
+            ],
+        }
+        tracker = MessageSnapshotTracker()
+        self.assertEqual([], tracker.ingest(extract_message_records(initial_payload)))
+        new_records = tracker.ingest(extract_message_records(next_payload))
+        self.assertEqual(1, len(new_records))
+        self.assertEqual("B", new_records[0].sender)
+        self.assertEqual("新消息", new_records[0].content)
+        self.assertEqual([], tracker.ingest(extract_message_records(next_payload)))
+
+    def test_duplicate_text_messages_are_counted_as_separate_occurrences(self) -> None:
+        tracker = MessageSnapshotTracker()
+        message = {"sender": "A", "message": "相同正文"}
+        self.assertEqual([], tracker.ingest(extract_message_records([message])))
+        new_records = tracker.ingest(
+            extract_message_records([message, message])
+        )
+        self.assertEqual(1, len(new_records))
+
+    def test_private_optional_config_is_ignored_and_not_embedded_in_exe(self) -> None:
+        gitignore = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("*.private.json", gitignore.splitlines())
+        self.assertFalse((PROJECT_ROOT / "chat_config.example.json").exists())
+
+        build_script = BUILD_SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            'copy /Y "desktop_pet.private.json" "dist\\desktop_pet.private.json"',
+            build_script,
+        )
+        self.assertNotIn(
+            '--add-data "desktop_pet.private.json',
+            build_script,
+        )
+
+    def test_removed_game_feature_has_no_runtime_or_release_residue(self) -> None:
+        source = PET_APP_PATH.read_text(encoding="utf-8")
+        build_script = BUILD_SCRIPT_PATH.read_text(encoding="utf-8")
+        package_script = (
+            PROJECT_ROOT / "tools" / "package_release.py"
+        ).read_text(encoding="utf-8")
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertFalse((PROJECT_ROOT / "plugins").exists())
+        self.assertFalse((PROJECT_ROOT / "plugin_manager.py").exists())
+        self.assertFalse((PROJECT_ROOT / "THIRD_PARTY_NOTICES.md").exists())
+        for forbidden in (
+            "adarkroom_native",
+            "DarkRoomHost",
+            "NativeDarkRoomGame",
+            "GAME_PLUGIN_ID",
+            "_game_host",
+            "game_notifications_enabled",
+        ):
+            self.assertNotIn(forbidden, source)
+            self.assertNotIn(forbidden, package_script)
+        self.assertNotIn("plugins\\adarkroom_native", build_script)
+        self.assertIn("完整移除黑暗房间游戏功能", readme)
+
+    def test_optional_monitor_is_config_presence_driven_and_hidden_when_absent(
+        self,
+    ) -> None:
+        source = PET_APP_PATH.read_text(encoding="utf-8")
+        self.assertIn("ChatMonitor(self._chat_config, self)", source)
+        self.assertIn(
+            "self._chat_monitor.new_messages.connect(self._on_chat_messages)",
+            source,
+        )
+        self.assertIn("self._message_popup.show_messages(", source)
+        self.assertIn("if self.play_message_notification():", source)
+        self.assertIn("if private_config_path.is_file():", source)
+        self.assertIn("if self._chat_monitor is not None:", source)
+        self.assertNotIn('"网页新消息提醒"', source)
+        self.assertNotIn("chat_monitor_enabled", source)
+
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        for hidden_term in (
+            "chat_config",
+            "desktop_pet.private",
+            "WebSocket",
+            "网页新消息",
+            "聊天网页",
+            "API 轮询",
+        ):
+            self.assertNotIn(hidden_term, readme)
 
     def test_new_character_assets_keep_a_stable_baseline(self) -> None:
         sheet_path = MANIFEST_PATH.parent / self.manifest["spritesheet"]
